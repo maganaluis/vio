@@ -2,6 +2,29 @@
 
 This comprehensive technical documentation provides a complete implementation guide for Visual Inertial Odometry on the Holybro X650x drone platform with Pixhawk 6C, Raspberry Pi 5, Intel RealSense D455, 3 USB cameras, and HAILO AI Hat 26 TOPS acceleration.
 
+## Platform and Middleware Decisions
+
+### Operating System: Raspberry Pi OS (64-bit)
+After evaluating options, **Raspberry Pi OS (Raspbian) 64-bit** is selected over Ubuntu for the following reasons:
+- **Native optimization** for Raspberry Pi 5 hardware
+- **Lower resource usage** (~2GB less RAM than Ubuntu)
+- **Better real-time performance** with available RT kernel patches
+- **Superior camera and GPU driver support**
+- **No ROS2 dependency** allows us to use the native OS
+
+### Middleware: Direct Communication (No ROS2)
+The system will **not use ROS2** based on several factors:
+- **OpenVINS runs standalone** as a C++ library without ROS dependencies
+- **Direct MAVLink communication** with PX4 eliminates middleware latency (5-10ms vs 30-50ms with ROS2)
+- **Resource efficiency** critical for embedded systems (saves ~200MB RAM, reduces CPU overhead)
+- **Industry trend** shows production systems moving away from ROS for core control (Unitree SDK, DJI OSDK, Boston Dynamics SDK all provide direct APIs)
+- **Simplified deployment** without complex DDS configuration and dependency management
+
+Communication architecture uses:
+- **ZeroMQ** for inter-process communication
+- **Direct MAVLink** (pymavlink) for PX4 interface
+- **Python async/await** for coordination layer
+
 ## 1. VIO algorithm selection and performance metrics
 
 ### Algorithm comparison matrix for ARM deployment
@@ -174,90 +197,113 @@ camera_3:  # RealSense D455
 
 This configuration provides **40-60% field-of-view overlap** between adjacent cameras, optimal for robust feature tracking across camera boundaries.
 
-## 4. PX4 integration via ROS2
+## 4. PX4 integration via Direct MAVLink
 
-### Setting up px4_ros_com bridge
+### Direct MAVLink Communication (No ROS2)
+
+Based on the platform decisions above, the system uses direct MAVLink communication instead of ROS2:
 
 ```bash
-# Install dependencies for Ubuntu 24.04
-sudo apt install ros-humble-px4-msgs ros-humble-px4-ros-com
+# Install on Raspberry Pi OS
+pip3 install pymavlink
 
-# Clone and build px4_ros_com
-mkdir -p ~/ros2_ws/src
-cd ~/ros2_ws/src
-git clone https://github.com/PX4/px4_ros_com.git
-git clone https://github.com/PX4/px4_msgs.git
-cd ..
-colcon build --symlink-install
-
-# Launch micro-XRCE-DDS agent
-MicroXRCEAgent udp4 -p 8888
+# No ROS2, no micro-XRCE-DDS, no px4_ros_com needed
 ```
 
-### VIO to PX4 odometry publisher
+### VIO to PX4 MAVLink bridge
 
-```cpp
-#include <rclcpp/rclcpp.hpp>
-#include <px4_msgs/msg/vehicle_visual_odometry.hpp>
-#include <px4_msgs/msg/timesync_status.hpp>
+```python
+from pymavlink import mavutil
+import zmq
+import numpy as np
+import time
 
-class VIOToPX4Bridge : public rclcpp::Node {
-private:
-    rclcpp::Publisher<px4_msgs::msg::VehicleVisualOdometry>::SharedPtr odom_pub_;
-    rclcpp::Subscription<px4_msgs::msg::TimesyncStatus>::SharedPtr timesync_sub_;
-    std::atomic<uint64_t> timestamp_offset_{0};
+class VIOToPX4Bridge:
+    def __init__(self, connection_string='/dev/ttyACM0'):
+        # Direct MAVLink connection to Pixhawk
+        self.mav = mavutil.mavlink_connection(connection_string, baud=115200)
+        self.mav.wait_heartbeat()
+        print("Connected to PX4 via MAVLink")
+        
+        # ZeroMQ subscriber for VIO data
+        self.context = zmq.Context()
+        self.vio_socket = self.context.socket(zmq.SUB)
+        self.vio_socket.connect("tcp://localhost:5557")
+        self.vio_socket.setsockopt_string(zmq.SUBSCRIBE, "")
     
-public:
-    VIOToPX4Bridge() : Node("vio_to_px4_bridge") {
-        // Configure QoS for PX4 compatibility
-        auto qos = rclcpp::QoS(10)
-            .reliability(RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT)
-            .durability(RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL);
+    def run(self):
+        """Main bridge loop - receives VIO poses and sends to PX4"""
+        while True:
+            # Receive VIO pose from OpenVINS
+            pose_data = self.vio_socket.recv_json()
             
-        odom_pub_ = this->create_publisher<px4_msgs::msg::VehicleVisualOdometry>(
-            "/fmu/in/vehicle_visual_odometry", qos);
+            # Extract pose information
+            position = pose_data['position']  # [x, y, z]
+            quaternion = pose_data['quaternion']  # [w, x, y, z]
             
-        timesync_sub_ = this->create_subscription<px4_msgs::msg::TimesyncStatus>(
-            "/fmu/out/timesync_status", qos,
-            [this](const px4_msgs::msg::TimesyncStatus::SharedPtr msg) {
-                timestamp_offset_ = msg->timestamp - msg->remote_timestamp;
-            });
-    }
+            # Convert quaternion to Euler angles
+            roll, pitch, yaw = self.quaternion_to_euler(quaternion)
+            
+            # Send VISION_POSITION_ESTIMATE to PX4
+            self.mav.mav.vision_position_estimate_send(
+                usec=int(time.time() * 1e6),  # timestamp in microseconds
+                x=position[0],
+                y=position[1],
+                z=position[2],
+                roll=roll,
+                pitch=pitch,
+                yaw=yaw,
+                covariance=[0.01] * 21,  # position covariance
+                reset_counter=0
+            )
+            
+            # Alternative: Send ODOMETRY message for richer data
+            if 'velocity' in pose_data:
+                self.send_odometry(pose_data)
     
-    void publish_vio_odometry(const Eigen::Vector3d& position,
-                              const Eigen::Quaterniond& orientation,
-                              const Eigen::Vector3d& velocity) {
-        auto msg = px4_msgs::msg::VehicleVisualOdometry();
+    def quaternion_to_euler(self, q):
+        """Convert quaternion [w,x,y,z] to Euler angles"""
+        w, x, y, z = q
         
-        // Convert to PX4 timestamp
-        msg.timestamp = get_px4_timestamp();
-        msg.timestamp_sample = msg.timestamp;
+        # Roll (x-axis rotation)
+        sinr_cosp = 2 * (w * x + y * z)
+        cosr_cosp = 1 - 2 * (x * x + y * y)
+        roll = np.arctan2(sinr_cosp, cosr_cosp)
         
-        // Position in NED frame
-        msg.x = position.x();
-        msg.y = -position.y();  // Convert from ROS to NED
-        msg.z = -position.z();
+        # Pitch (y-axis rotation)
+        sinp = 2 * (w * y - z * x)
+        pitch = np.arcsin(np.clip(sinp, -1, 1))
         
-        // Orientation quaternion (convert from ROS to NED)
-        Eigen::Quaterniond q_ned = convert_ros_to_ned(orientation);
-        msg.q[0] = q_ned.w();
-        msg.q[1] = q_ned.x();
-        msg.q[2] = q_ned.y();
-        msg.q[3] = q_ned.z();
+        # Yaw (z-axis rotation)
+        siny_cosp = 2 * (w * z + x * y)
+        cosy_cosp = 1 - 2 * (y * y + z * z)
+        yaw = np.arctan2(siny_cosp, cosy_cosp)
         
-        // Velocity in body frame
-        msg.vx = velocity.x();
-        msg.vy = velocity.y();
-        msg.vz = velocity.z();
-        
-        // Covariances (tune based on VIO algorithm confidence)
-        msg.pose_covariance[0] = 0.01;  // x variance
-        msg.pose_covariance[6] = 0.01;  // y variance
-        msg.pose_covariance[11] = 0.01; // z variance
-        
-        odom_pub_->publish(msg);
-    }
-};
+        return roll, pitch, yaw
+    
+    def send_odometry(self, pose_data):
+        """Send full ODOMETRY message with velocity information"""
+        self.mav.mav.odometry_send(
+            time_usec=int(time.time() * 1e6),
+            frame_id=mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+            child_frame_id=mavutil.mavlink.MAV_FRAME_BODY_FRD,
+            x=pose_data['position'][0],
+            y=-pose_data['position'][1],  # Convert to NED
+            z=-pose_data['position'][2],
+            q=pose_data['quaternion'],
+            vx=pose_data['velocity'][0],
+            vy=pose_data['velocity'][1],
+            vz=pose_data['velocity'][2],
+            rollspeed=0,  # If available from VIO
+            pitchspeed=0,
+            yawspeed=0,
+            pose_covariance=[0.01] * 21,
+            velocity_covariance=[0.1] * 21
+        )
+
+if __name__ == "__main__":
+    bridge = VIOToPX4Bridge()
+    bridge.run()
 ```
 
 ### PX4 parameter configuration for VIO
@@ -283,12 +329,14 @@ param set EKF2_NOAID_TOUT 5000000 # 5 second timeout before GPS fallback
 ### CPU affinity and real-time configuration
 
 ```bash
-# Install Ubuntu real-time kernel
-sudo pro attach YOUR_TOKEN
-sudo pro enable realtime-kernel --variant=raspi
+# For Raspberry Pi OS (not Ubuntu)
+# Install RT kernel patches
+sudo apt install raspberrypi-kernel-headers
+wget https://github.com/raspberrypi/linux/releases/download/stable_20240124/linux-image-6.1.0-rpi7-rpi-v8_6.1.0-1_arm64.deb
+sudo dpkg -i linux-image-*-rt*.deb
 
 # Configure CPU isolation for VIO threads
-echo "isolcpus=2,3 rcu_nocbs=2,3 nohz_full=2,3" >> /boot/firmware/cmdline.txt
+echo "isolcpus=2,3 rcu_nocbs=2,3 nohz_full=2,3" >> /boot/cmdline.txt
 
 # Set thread affinity in VIO application
 taskset -c 2,3 ./openvins_node
