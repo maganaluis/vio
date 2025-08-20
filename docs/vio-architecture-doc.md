@@ -28,7 +28,7 @@ graph TD
     end
 
     subgraph "Flight Controller"
-        PX4[PX4 Autopilot]
+        ARDUPILOT[ArduPilot Autopilot]
     end
 
     IMU --> VIO
@@ -40,7 +40,7 @@ graph TD
     HAILO --> VIO
     VIO --> BRIDGE
     BRIDGE --> MSG
-    MSG --> PX4
+    MSG --> ARDUPILOT
 ```
 
 ## Core Design Principles
@@ -122,10 +122,12 @@ class VIOPose:
     confidence: float
 
 class VIOBridge:
-    def __init__(self):
+    def __init__(self, enable_fpv=True):
         self.context = zmq.asyncio.Context()
         self.vio_socket = self.context.socket(zmq.SUB)
-        self.px4_socket = self.context.socket(zmq.PUB)
+        self.ardupilot_socket = self.context.socket(zmq.PUB)
+        self.fpv_socket = self.context.socket(zmq.PUB) if enable_fpv else None
+        self.fpv_enabled = enable_fpv
         
     async def run(self):
         """Main communication loop"""
@@ -134,22 +136,36 @@ class VIOBridge:
             pose_data = await self.vio_socket.recv_json()
             pose = self.parse_vio_pose(pose_data)
             
-            # Transform to PX4 format
-            px4_msg = self.to_px4_format(pose)
+            # Transform to ArduPilot format
+            ardupilot_msg = self.to_ardupilot_format(pose)
             
             # Send to flight controller
-            await self.px4_socket.send_json(px4_msg)
+            await self.ardupilot_socket.send_json(ardupilot_msg)
             
-    def to_px4_format(self, pose: VIOPose) -> dict:
-        """Convert VIO pose to PX4 visual odometry message"""
+            # Send FPV telemetry if enabled
+            if self.fpv_enabled:
+                await self.send_fpv_telemetry(pose)
+            
+    def to_ardupilot_format(self, pose: VIOPose) -> dict:
+        """Convert VIO pose to ArduPilot visual odometry message"""
         return {
             'timestamp': int(pose.timestamp * 1e6),
             'x': pose.position[0],
             'y': -pose.position[1],  # ROS to NED
             'z': -pose.position[2],
             'q': pose.orientation.tolist(),
-            'confidence': pose.confidence
+            'confidence': pose.confidence,
+            'reset_counter': 0
         }
+    
+    async def send_fpv_telemetry(self, pose: VIOPose):
+        """Send additional telemetry for FPV OSD"""
+        fpv_msg = {
+            'vio_health': pose.confidence > 0.7,
+            'feature_count': getattr(pose, 'feature_count', 0),
+            'processing_ms': getattr(pose, 'processing_ms', 0)
+        }
+        await self.fpv_socket.send_json(fpv_msg)
 ```
 
 ### 5. Message Queue Architecture
@@ -165,7 +181,8 @@ ENDPOINTS = {
     'cameras': 'tcp://localhost:5555',
     'imu': 'tcp://localhost:5556',
     'vio_output': 'tcp://localhost:5557',
-    'px4_bridge': 'tcp://localhost:5558'
+    'ardupilot_bridge': 'tcp://localhost:5558',
+    'fpv_telemetry': 'tcp://localhost:5559'  # FPV OSD data
 }
 ```
 
@@ -190,10 +207,12 @@ services:
     build: ./vio_core
     command: ./openvins_node
     
-  px4_bridge:
-    build: ./px4_bridge
-    command: python bridge.py
+  ardupilot_bridge:
+    build: ./ardupilot_bridge
+    command: python bridge.py --enable-fpv
     network_mode: host
+    environment:
+      - MAVLINK_BAUD=921600  # High baud rate for low latency
 ```
 
 ### Resource Allocation
@@ -219,8 +238,9 @@ python test_multicam_sync.py
 
 ### 2. Testing Strategy
 - Unit tests for each component
-- Hardware-in-the-loop simulation with PX4 SITL
+- Hardware-in-the-loop simulation with ArduPilot SITL
 - Record and replay sensor data for debugging
+- FPV system latency testing with OSD overlay
 
 ### 3. Performance Monitoring
 ```python
@@ -314,8 +334,8 @@ python camera_driver/multi_camera.py
 # Terminal 2: Start VIO core
 ./vio_core/build/vio_node
 
-# Terminal 3: Start PX4 bridge
-python px4_bridge/bridge.py
+# Terminal 3: Start ArduPilot bridge with FPV support
+python ardupilot_bridge/bridge.py --enable-fpv --baud 921600
 
 # Terminal 4: Monitor system
 python tools/monitor.py
@@ -336,5 +356,6 @@ python tools/monitor.py
 ## References
 
 - [OpenVINS Documentation](https://docs.openvins.com/)
-- [PX4 Visual Inertial Odometry](https://docs.px4.io/main/en/computer_vision/visual_inertial_odometry.html)
+- [ArduPilot Vision Positioning](https://ardupilot.org/copter/docs/common-non-gps-navigation.html)
+- [ArduPilot FPV Setup Guide](https://ardupilot.org/copter/docs/common-fpv-first-person-view.html)
 - [HAILO Developer Guide](https://hailo.ai/developer-zone/)

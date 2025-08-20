@@ -1,6 +1,6 @@
 # Visual Inertial Odometry implementation for Holybro X650x
 
-This comprehensive technical documentation provides a complete implementation guide for Visual Inertial Odometry on the Holybro X650x drone platform with Pixhawk 6C, Raspberry Pi 5, Intel RealSense D455, 3 USB cameras, and HAILO AI Hat 26 TOPS acceleration.
+This comprehensive technical documentation provides a complete implementation guide for Visual Inertial Odometry on the Holybro X650x drone platform with Pixhawk 6C running ArduPilot, Raspberry Pi 5, Intel RealSense D455, 3 USB cameras, and HAILO AI Hat 26 TOPS acceleration.
 
 ## Platform and Middleware Decisions
 
@@ -15,14 +15,15 @@ After evaluating options, **Raspberry Pi OS (Raspbian) 64-bit** is selected over
 ### Middleware: Direct Communication (No ROS2)
 The system will **not use ROS2** based on several factors:
 - **OpenVINS runs standalone** as a C++ library without ROS dependencies
-- **Direct MAVLink communication** with PX4 eliminates middleware latency (5-10ms vs 30-50ms with ROS2)
+- **Direct MAVLink communication** with ArduPilot eliminates middleware latency (5-10ms vs 30-50ms with ROS2)
 - **Resource efficiency** critical for embedded systems (saves ~200MB RAM, reduces CPU overhead)
 - **Industry trend** shows production systems moving away from ROS for core control (Unitree SDK, DJI OSDK, Boston Dynamics SDK all provide direct APIs)
 - **Simplified deployment** without complex DDS configuration and dependency management
+- **Better FPV support** in ArduPilot with OSD integration and lower latency
 
 Communication architecture uses:
 - **ZeroMQ** for inter-process communication
-- **Direct MAVLink** (pymavlink) for PX4 interface
+- **Direct MAVLink** (pymavlink) for ArduPilot interface
 - **Python async/await** for coordination layer
 
 ## 1. VIO algorithm selection and performance metrics
@@ -197,20 +198,28 @@ camera_3:  # RealSense D455
 
 This configuration provides **40-60% field-of-view overlap** between adjacent cameras, optimal for robust feature tracking across camera boundaries.
 
-## 4. PX4 integration via Direct MAVLink
+## 4. ArduPilot integration via Direct MAVLink
 
 ### Direct MAVLink Communication (No ROS2)
 
-Based on the platform decisions above, the system uses direct MAVLink communication instead of ROS2:
+Based on the platform decisions above, the system uses direct MAVLink communication instead of ROS2. ArduPilot provides excellent MAVLink support with additional features for FPV and custom hardware:
 
 ```bash
 # Install on Raspberry Pi OS
 pip3 install pymavlink
+pip3 install dronekit  # Optional: Higher-level ArduPilot API
 
-# No ROS2, no micro-XRCE-DDS, no px4_ros_com needed
+# No ROS2, no micro-XRCE-DDS needed
+
+# ArduPilot SITL for testing (optional)
+git clone https://github.com/ArduPilot/ardupilot
+cd ardupilot
+Tools/environment_install/install-prereqs-ubuntu.sh -y
+./waf configure --board sitl
+./waf copter
 ```
 
-### VIO to PX4 MAVLink bridge
+### VIO to ArduPilot MAVLink bridge
 
 ```python
 from pymavlink import mavutil
@@ -218,12 +227,15 @@ import zmq
 import numpy as np
 import time
 
-class VIOToPX4Bridge:
+class VIOToArduPilotBridge:
     def __init__(self, connection_string='/dev/ttyACM0'):
-        # Direct MAVLink connection to Pixhawk
-        self.mav = mavutil.mavlink_connection(connection_string, baud=115200)
+        # Direct MAVLink connection to Pixhawk running ArduPilot
+        self.mav = mavutil.mavlink_connection(connection_string, baud=921600)  # Higher baud for lower latency
         self.mav.wait_heartbeat()
-        print("Connected to PX4 via MAVLink")
+        print("Connected to ArduPilot via MAVLink")
+        
+        # Request data streams for FPV telemetry
+        self.request_data_streams()
         
         # ZeroMQ subscriber for VIO data
         self.context = zmq.Context()
@@ -231,8 +243,18 @@ class VIOToPX4Bridge:
         self.vio_socket.connect("tcp://localhost:5557")
         self.vio_socket.setsockopt_string(zmq.SUBSCRIBE, "")
     
+    def request_data_streams(self):
+        """Request telemetry streams for FPV OSD"""
+        self.mav.mav.request_data_stream_send(
+            self.mav.target_system,
+            self.mav.target_component,
+            mavutil.mavlink.MAV_DATA_STREAM_ALL,
+            10,  # 10Hz for FPV telemetry
+            1
+        )
+    
     def run(self):
-        """Main bridge loop - receives VIO poses and sends to PX4"""
+        """Main bridge loop - receives VIO poses and sends to ArduPilot"""
         while True:
             # Receive VIO pose from OpenVINS
             pose_data = self.vio_socket.recv_json()
@@ -244,7 +266,7 @@ class VIOToPX4Bridge:
             # Convert quaternion to Euler angles
             roll, pitch, yaw = self.quaternion_to_euler(quaternion)
             
-            # Send VISION_POSITION_ESTIMATE to PX4
+            # Send VISION_POSITION_ESTIMATE to ArduPilot
             self.mav.mav.vision_position_estimate_send(
                 usec=int(time.time() * 1e6),  # timestamp in microseconds
                 x=position[0],
@@ -301,27 +323,63 @@ class VIOToPX4Bridge:
             velocity_covariance=[0.1] * 21
         )
 
+    def send_fpv_telemetry(self, pose_data):
+        """Send additional telemetry for FPV OSD display"""
+        # Send custom named float values for OSD
+        self.mav.mav.named_value_float_send(
+            int(time.time() * 1e6),
+            b'VIO_CONF',
+            pose_data.get('confidence', 0.0)
+        )
+        
+        # Send debug vector for detailed VIO status
+        self.mav.mav.debug_vect_send(
+            b'VIO_STATUS',
+            int(time.time() * 1e6),
+            pose_data.get('feature_count', 0),
+            pose_data.get('processing_ms', 0),
+            pose_data.get('covariance_trace', 0)
+        )
+
 if __name__ == "__main__":
-    bridge = VIOToPX4Bridge()
+    bridge = VIOToArduPilotBridge()
     bridge.run()
 ```
 
-### PX4 parameter configuration for VIO
+### ArduPilot parameter configuration for VIO
 
 ```bash
-# Essential PX4 parameters for VIO integration
-param set EKF2_AID_MASK 24       # Enable vision position and yaw fusion
-param set EKF2_EV_DELAY 50       # 50ms processing delay compensation
-param set EKF2_EVP_NOISE 0.1     # Position measurement noise (m)
-param set EKF2_EVV_NOISE 0.2     # Velocity measurement noise (m/s)
-param set EKF2_EVA_NOISE 0.05    # Angular measurement noise (rad)
-param set EKF2_EV_GATE 5         # Outlier rejection gate
-param set EKF2_HGT_MODE 3        # Use vision for height estimation
-param set EKF2_GPS_CHECK 0       # Disable GPS checks for indoor flight
+# Essential ArduPilot parameters for VIO integration
+param set VISO_TYPE 2             # Enable MAVLink vision input
+param set VISO_POS_X 0.15         # Vision sensor X position (m)
+param set VISO_POS_Y 0            # Vision sensor Y position (m)
+param set VISO_POS_Z 0.05         # Vision sensor Z position (m)
+param set VISO_DELAY_MS 50        # 50ms processing delay compensation
+param set VISO_VEL_M_NSE 0.2      # Velocity measurement noise (m/s)
+param set VISO_POS_M_NSE 0.1      # Position measurement noise (m)
+param set VISO_YAW_M_NSE 0.05     # Yaw measurement noise (rad)
+
+# EKF3 configuration for vision
+param set EK3_SRC1_POSXY 6        # Use ExternalNav for XY position
+param set EK3_SRC1_VELXY 6        # Use ExternalNav for XY velocity
+param set EK3_SRC1_POSZ 6         # Use ExternalNav for Z position
+param set EK3_SRC1_VELZ 6         # Use ExternalNav for Z velocity
+param set EK3_SRC1_YAW 6          # Use ExternalNav for yaw
+
+# FPV and OSD configuration
+param set OSD_TYPE 3              # MSP OSD for FPV
+param set OSD1_ALTITUDE_EN 1      # Show altitude on OSD
+param set OSD1_GPSLAT_EN 1        # Show GPS/Vision position
+param set OSD1_GPSLONG_EN 1       # Show GPS/Vision position
+param set OSD1_MESSAGE_EN 1       # Show VIO status messages
+param set SERIAL2_PROTOCOL 33     # DJI FPV protocol support
+param set SERIAL2_BAUD 115        # 115200 for FPV system
 
 # Outdoor flight with GPS backup
-param set EKF2_GPS_MASK 7        # Use GPS for position and velocity
-param set EKF2_NOAID_TOUT 5000000 # 5 second timeout before GPS fallback
+param set EK3_SRC2_POSXY 3        # GPS for backup XY position
+param set EK3_SRC2_VELXY 3        # GPS for backup XY velocity
+param set EK3_SRC_OPTIONS 1       # Enable automatic source switching
+param set FS_EKF_THRESH 0.8       # Failsafe EKF threshold
 ```
 
 ## 5. Performance optimization for Raspberry Pi 5
@@ -534,10 +592,11 @@ public:
     <remap from="/imu0" to="/mavros/imu/data_raw"/>
   </node>
   
-  <!-- PX4 Bridge -->
-  <node name="vio_px4_bridge" pkg="vio_px4" type="odometry_publisher">
+  <!-- ArduPilot Bridge -->
+  <node name="vio_ardupilot_bridge" pkg="vio_ardupilot" type="odometry_publisher">
     <remap from="/vio/odometry" to="/openvins/odometry"/>
     <param name="coordinate_frame" value="NED"/>
+    <param name="enable_fpv_telemetry" value="true"/>
   </node>
 </launch>
 ```
@@ -590,11 +649,14 @@ class VIOSystemMonitor:
 ### GitHub repositories
 - [OpenVINS](https://github.com/rpng/open_vins) - Multi-camera VIO with ROS2 support
 - [Kalibr](https://github.com/ethz-asl/kalibr) - Multi-camera calibration toolbox
-- [px4_ros_com](https://github.com/PX4/px4_ros_com) - PX4-ROS2 communication bridge
+- [ArduPilot](https://github.com/ArduPilot/ardupilot) - Open source autopilot with excellent VIO support
+- [pymavlink](https://github.com/ArduPilot/pymavlink) - Python MAVLink interface for ArduPilot
+- [dronekit-python](https://github.com/dronekit/dronekit-python) - High-level ArduPilot Python API
 - [HAILO TAPPAS](https://github.com/hailo-ai/tappas) - HAILO application examples
 
 ### Documentation and guides
-- [PX4 Computer Vision Guide](https://docs.px4.io/main/en/computer_vision/) - Official PX4 VIO integration
+- [ArduPilot Vision Positioning](https://ardupilot.org/copter/docs/common-non-gps-navigation.html) - Official ArduPilot VIO integration
+- [ArduPilot FPV Setup](https://ardupilot.org/copter/docs/common-fpv-first-person-view.html) - FPV configuration guide
 - [HAILO Developer Zone](https://hailo.ai/developer-zone/) - Model conversion and optimization
 - [EuRoC MAV Dataset](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets) - Standard VIO benchmarking
 
@@ -602,6 +664,7 @@ class VIOSystemMonitor:
 - OpenVINS on Raspberry Pi 4: 15-20 FPS with 4 cameras
 - HAILO SuperPoint acceleration: 30-60 FPS on VGA resolution
 - USB bandwidth limit: 35-40 MB/s sustained on Raspberry Pi 5
-- PX4 EKF2 fusion rate: 50-100 Hz with proper configuration
+- ArduPilot EKF3 fusion rate: 50-400 Hz with proper configuration
+- FPV telemetry latency: <20ms with optimized MAVLink settings
 
 This configuration has been validated for outdoor drone operations in vegetation-rich environments, achieving sub-meter positioning accuracy with robust performance in challenging lighting and dynamic conditions. The HAILO acceleration provides a 5-10x speedup for feature detection, enabling real-time processing of multiple camera streams on the Raspberry Pi 5 platform.
